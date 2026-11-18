@@ -2,3 +2,5 @@
 raids.db
 venv/
 __pycache__/
+env.example.txt
+*.env.txt

@@ -43,8 +43,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Kept next to bot.py so it never mixes with another bot's files on the same Pi
 DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "raids.db"))
 GUILD_ID = os.getenv("GUILD_ID")  # optional: makes /raidpanel show up instantly
-# Optional: channel (forum or text) where the bot keeps the panel automatically - no /raidpanel needed
-PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID") or 0)
+# Optional: channel(s) (forum or text) where the bot keeps the panel automatically - no /raidpanel
+# needed. One per server, comma separated, e.g. PANEL_CHANNEL_ID=111111111111,222222222222
+PANEL_CHANNEL_IDS = [int(x) for x in os.getenv("PANEL_CHANNEL_ID", "").replace(" ", "").split(",") if x.isdigit()]
 FORUM_ARCHIVE_MINUTES = 10080  # forum posts stay active 7 days (Discord's max) before going quiet
 
 DEFAULT_NIGHTS = "Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, Monday"
@@ -113,6 +114,18 @@ def get_setting(key):
 def set_setting(key, value):
     db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
     db.commit()
+
+
+def migrate_panel_settings():
+    old_for = get_setting("panel_for")
+    if old_for and get_setting(f"panel_channel:{old_for}") is None:
+        set_setting(f"panel_channel:{old_for}", get_setting("panel_channel"))
+        set_setting(f"panel_message:{old_for}", get_setting("panel_message"))
+    db.execute("DELETE FROM settings WHERE key IN ('panel_for', 'panel_channel', 'panel_message')")
+    db.commit()
+
+
+migrate_panel_settings()
 
 
 def get_poll(poll_id):
@@ -648,12 +661,10 @@ async def wake_thread(channel):
             log.warning("Couldn't reopen thread %s (bot needs Manage Threads)", channel.id)
 
 
-async def ensure_panel():
-    """Make sure the panel exists in PANEL_CHANNEL_ID; create (and pin) it if it's missing."""
-    if not PANEL_CHANNEL_ID:
-        return
-    ch_id, msg_id = get_setting("panel_channel"), get_setting("panel_message")
-    if ch_id and msg_id and get_setting("panel_for") == str(PANEL_CHANNEL_ID):
+async def ensure_panel(target_id: int):
+    """Make sure a panel exists in one channel from PANEL_CHANNEL_ID; create (and pin) it if missing."""
+    ch_id, msg_id = get_setting(f"panel_channel:{target_id}"), get_setting(f"panel_message:{target_id}")
+    if ch_id and msg_id:
         try:
             ch = client.get_channel(int(ch_id)) or await client.fetch_channel(int(ch_id))
             await wake_thread(ch)
@@ -661,13 +672,13 @@ async def ensure_panel():
             await msg.edit(embed=panel_embed(), view=panel_view())  # refresh in case buttons changed
             return
         except discord.NotFound:
-            log.info("Panel was deleted, making a new one")
+            log.info("Panel for channel %s was deleted, making a new one", target_id)
         except discord.HTTPException:
-            log.exception("Couldn't check the panel")
+            log.exception("Couldn't check the panel for channel %s", target_id)
             return
 
     try:
-        target = client.get_channel(PANEL_CHANNEL_ID) or await client.fetch_channel(PANEL_CHANNEL_ID)
+        target = client.get_channel(target_id) or await client.fetch_channel(target_id)
         if isinstance(target, discord.ForumChannel):
             thread, msg = await target.create_thread(
                 name="🏰 Raid Planner", embed=panel_embed(), view=panel_view(),
@@ -676,34 +687,43 @@ async def ensure_panel():
             try:
                 await thread.edit(pinned=True)
             except discord.HTTPException:
-                log.warning("Couldn't pin the panel post (bot needs Manage Threads)")
+                log.warning("Couldn't pin the panel post in %s (bot needs Manage Threads)", target_id)
             ch_id = thread.id
         else:
             msg = await target.send(embed=panel_embed(), view=panel_view())
             try:
                 await msg.pin()
             except discord.HTTPException:
-                log.warning("Couldn't pin the panel (bot needs Manage Messages)")
+                log.warning("Couldn't pin the panel in %s (bot needs Manage Messages)", target_id)
             ch_id = target.id
     except discord.HTTPException:
-        log.exception("Couldn't create the panel in channel %s - check PANEL_CHANNEL_ID and permissions", PANEL_CHANNEL_ID)
+        log.exception(
+            "Couldn't create the panel in channel %s - check the ID in PANEL_CHANNEL_ID and that the "
+            "bot can see that channel and post in it", target_id,
+        )
         return
-    set_setting("panel_channel", ch_id)
-    set_setting("panel_message", msg.id)
-    set_setting("panel_for", PANEL_CHANNEL_ID)
+    set_setting(f"panel_channel:{target_id}", ch_id)
+    set_setting(f"panel_message:{target_id}", msg.id)
     log.info("Panel posted in %s", ch_id)
+
+
+async def ensure_panels():
+    for target_id in PANEL_CHANNEL_IDS:
+        await ensure_panel(target_id)
 
 
 @tasks.loop(hours=6)
 async def keep_panel_awake():
-    ch_id = get_setting("panel_channel")
-    if ch_id:
+    for target_id in PANEL_CHANNEL_IDS:
+        ch_id = get_setting(f"panel_channel:{target_id}")
+        if not ch_id:
+            continue
         ch = client.get_channel(int(ch_id))
         if ch is None:
             try:
                 ch = await client.fetch_channel(int(ch_id))
             except discord.HTTPException:
-                return
+                continue
         await wake_thread(ch)
 
 
@@ -753,8 +773,8 @@ async def on_ready():
     log.info("Logged in as %s (%s)", client.user, client.user.id)
     if not getattr(client, "panel_checked", False):  # on_ready can fire again after reconnects
         client.panel_checked = True
-        await ensure_panel()
-        if PANEL_CHANNEL_ID and not keep_panel_awake.is_running():
+        await ensure_panels()
+        if PANEL_CHANNEL_IDS and not keep_panel_awake.is_running():
             keep_panel_awake.start()
 
 
