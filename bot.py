@@ -139,6 +139,11 @@ def parse_time(time_s: str):
     return None
 
 
+def tz_abbr(dt=None) -> str:
+    """Short name of the server timezone, e.g. PST / PDT (follows daylight saving)."""
+    return (dt or datetime.now(TZ)).tzname() or TIMEZONE
+
+
 def fmt_time(t) -> str:
     return t.strftime("%I:%M %p").lstrip("0")
 
@@ -291,7 +296,8 @@ def poll_embed(poll) -> discord.Embed:
     if closed:
         desc = f"**{poll['title']}**\nPoll closed."
     else:
-        desc = f"**{poll['title']}**\nClick a day below, then pick every time slot you can make in the dropdown."
+        desc = (f"**{poll['title']}**\nClick a day below, then pick every time slot you can make in the dropdown."
+                f"\n*Times are server time ({tz_abbr()}).*")
     embed = discord.Embed(title="📊 Raid Night Poll", description=desc, color=COLOR_POLL)
     for name, value in fields:
         embed.add_field(name=name, value=value, inline=True)
@@ -530,7 +536,7 @@ def schedule_picker(date_key: str = "", time_key: str = ""):
             emoji="📅", default=key == date_key,
         ))
     time_opts = [
-        discord.SelectOption(label=label, value=key, emoji="🕗", default=key == time_key)
+        discord.SelectOption(label=f"{label} {tz_abbr()}", value=key, emoji="🕗", default=key == time_key)
         for label, key in time_choices()
     ]
     view = discord.ui.View(timeout=None)
@@ -538,7 +544,7 @@ def schedule_picker(date_key: str = "", time_key: str = ""):
         custom_id=f"rsched:date:{time_key or '-'}", placeholder="📅 Pick a date", options=date_opts, row=0,
     ))
     view.add_item(discord.ui.Select(
-        custom_id=f"rsched:time:{date_key or '-'}", placeholder=f"🕗 Pick a start time ({TIMEZONE})",
+        custom_id=f"rsched:time:{date_key or '-'}", placeholder=f"🕗 Pick a start time (server time, {tz_abbr()})",
         options=time_opts, row=1,
     ))
     ready = bool(date_key and time_key)
@@ -550,7 +556,7 @@ def schedule_picker(date_key: str = "", time_key: str = ""):
     content = "**Schedule a raid**: pick the date and start time, then click **Next**."
     when = picked_datetime(date_key, time_key)
     if when:
-        content += f"\nPicked: **<t:{int(when.timestamp())}:F>**"
+        content += f"\nPicked: **<t:{int(when.timestamp())}:F>** *(shown in your local time)*"
         if when < datetime.now(TZ):
             content += "  ⚠️ that time has already passed"
     return content, view
@@ -599,7 +605,7 @@ class RaidModal(discord.ui.Modal, title="Raid details"):
         )
         db.commit()
         raid = get_raid(cur.lastrowid)
-        title = f"⚔️ {raid['name']} · " + self.when.strftime("%a %b ") + str(self.when.day) + " " + fmt_time(self.when.time())
+        title = f"⚔️ {raid['name']} · " + self.when.strftime("%a %b ") + str(self.when.day) + " " + fmt_time(self.when.time()) + " " + tz_abbr(self.when)
         channel_id, msg = await post_board(interaction, title, raid_embed(raid), raid_view(raid), "Raid")
         db.execute("UPDATE raids SET channel_id = ?, message_id = ? WHERE id = ?", (channel_id, msg.id, raid["id"]))
         db.commit()
