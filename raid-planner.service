@@ -1,0 +1,15 @@
+[Unit]
+Description=Raid Planner Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Change "pi" to your Pi username if it's different
+User=pi
+WorkingDirectory=/home/pi/raid-planner
+ExecStart=/home/pi/raid-planner/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
