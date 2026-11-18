@@ -46,6 +46,9 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: makes /raidpanel show up instantly
 # Optional: channel(s) (forum or text) where the bot keeps the panel automatically - no /raidpanel
 # needed. One per server, comma separated, e.g. PANEL_CHANNEL_ID=111111111111,222222222222
 PANEL_CHANNEL_IDS = [int(x) for x in os.getenv("PANEL_CHANNEL_ID", "").replace(" ", "").split(",") if x.isdigit()]
+# Optional: roles to tag when a raid or Raid Night Poll is posted, by name (or ID), comma separated.
+# Matched in each server separately, e.g. PING_ROLES=Raider,Trial
+PING_ROLES = [r.strip().lower() for r in os.getenv("PING_ROLES", "").split(",") if r.strip()]
 FORUM_ARCHIVE_MINUTES = 10080  # forum posts stay active 7 days (Discord's max) before going quiet
 
 DEFAULT_NIGHTS = "Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, Monday"
@@ -637,14 +640,26 @@ def forum_of(channel):
     return None
 
 
+def ping_roles(guild):
+    """The PING_ROLES that exist in this server (matched by name or ID)."""
+    if guild is None or not PING_ROLES:
+        return []
+    return [r for r in guild.roles if r.name.lower() in PING_ROLES or str(r.id) in PING_ROLES]
+
+
 async def post_board(interaction, title, embed, view, tag_name):
     """Post a poll/raid. In a forum it gets its own post (tagged if the tag exists);
     in a normal text channel it's posted in that channel. Returns (channel_id, message)."""
+    roles = ping_roles(interaction.guild)
+    ping = dict(
+        content=" ".join(r.mention for r in roles) or None,
+        allowed_mentions=discord.AllowedMentions(roles=roles, users=False, everyone=False),
+    )
     forum = forum_of(interaction.channel)
     if forum is None:
-        msg = await interaction.channel.send(embed=embed, view=view)
+        msg = await interaction.channel.send(embed=embed, view=view, **ping)
         return interaction.channel.id, msg
-    kwargs = dict(name=title[:100], embed=embed, view=view, auto_archive_duration=FORUM_ARCHIVE_MINUTES)
+    kwargs = dict(name=title[:100], embed=embed, view=view, auto_archive_duration=FORUM_ARCHIVE_MINUTES, **ping)
     tags = [t for t in forum.available_tags if t.name.lower() == tag_name.lower()]
     if tags:
         kwargs["applied_tags"] = tags[:1]
