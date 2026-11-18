@@ -794,6 +794,20 @@ async def on_interaction(interaction: discord.Interaction):
             pass
 
 
+async def reject_unknown(interaction, row) -> bool:
+    """True (and tells the user) if a button's poll/raid isn't in this bot's database or the
+    button sits on a different post than the one saved - e.g. posts made by an older copy."""
+    msg = getattr(interaction, "message", None)
+    if row is not None and not (row["message_id"] and msg is not None and msg.id != row["message_id"]):
+        return False
+    await interaction.response.send_message(
+        "This post isn't linked to the bot any more (it was made by an older copy). "
+        "An officer can delete it and post a new one.",
+        ephemeral=True,
+    )
+    return True
+
+
 async def deny_if_not_officer(interaction) -> bool:
     if is_officer(interaction.user):
         return False
@@ -833,7 +847,9 @@ async def handle_panel(interaction, action):
 async def handle_poll_day(interaction, poll_id, day):
     """A day button was clicked: show that day's time-slot dropdown privately."""
     poll = get_poll(poll_id)
-    if not poll or poll["closed"]:
+    if await reject_unknown(interaction, poll):
+        return
+    if poll["closed"]:
         await interaction.response.send_message("This poll is closed.", ephemeral=True)
         return
     days = poll_days(poll)
@@ -904,7 +920,7 @@ async def handle_schedule_picker(interaction, rest):
 
 
 async def handle_poll_close(interaction, poll_id):
-    if await deny_if_not_officer(interaction):
+    if await deny_if_not_officer(interaction) or await reject_unknown(interaction, get_poll(poll_id)):
         return
     db.execute("UPDATE polls SET closed = 1 WHERE id = ?", (poll_id,))
     db.commit()
@@ -914,7 +930,9 @@ async def handle_poll_close(interaction, poll_id):
 
 async def handle_raid_signup(interaction, raid_id, action):
     raid = get_raid(raid_id)
-    if not raid or raid["status"] != "open":
+    if await reject_unknown(interaction, raid):
+        return
+    if raid["status"] != "open":
         await interaction.response.send_message("Signups are closed for this raid.", ephemeral=True)
         return
     uid = interaction.user.id
@@ -954,7 +972,9 @@ async def handle_raid_lock(interaction, raid_id):
     if await deny_if_not_officer(interaction):
         return
     raid = get_raid(raid_id)
-    if not raid or raid["status"] == "cancelled":
+    if await reject_unknown(interaction, raid):
+        return
+    if raid["status"] == "cancelled":
         await interaction.response.send_message("That raid was cancelled.", ephemeral=True)
         return
     new_status = "open" if raid["status"] == "locked" else "locked"
@@ -965,7 +985,7 @@ async def handle_raid_lock(interaction, raid_id):
 
 
 async def handle_raid_cancel(interaction, raid_id):
-    if await deny_if_not_officer(interaction):
+    if await deny_if_not_officer(interaction) or await reject_unknown(interaction, get_raid(raid_id)):
         return
     db.execute("UPDATE raids SET status = 'cancelled' WHERE id = ?", (raid_id,))
     db.commit()
