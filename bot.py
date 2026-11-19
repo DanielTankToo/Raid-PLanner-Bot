@@ -643,13 +643,32 @@ class PollModal(discord.ui.Modal, title="New Raid Night Poll"):
         await interaction.response.send_message(f"Poll posted ✅ [Jump to it]({msg.jump_url})", ephemeral=True)
 
 
-def schedule_picker(date_key: str = "", time_key: str = ""):
-    """Private message with a date dropdown, a time dropdown and a Next button.
+MAX_PING_ROLES = 3  # keeps the picks small enough to ride along in the buttons' IDs
+
+
+def encode_roles(role_ids) -> str:
+    return ".".join(str(i) for i in role_ids) or "-"
+
+
+def decode_roles(text):
+    """'-' -> [], '1.2' -> [1, 2], None (older pickers) -> None (use PING_ROLES)."""
+    if text is None:
+        return None
+    return [int(x) for x in text.split(".") if x.isdigit()][:MAX_PING_ROLES]
+
+
+def schedule_picker(guild, date_key: str = "", time_key: str = "", role_ids=None):
+    """Private message with date and time dropdowns, a role-to-tag dropdown and a Next button.
 
     The current picks ride along in each component's custom_id, so nothing is kept in
     memory and the picker still works if the bot restarts.
     date_key = 'YYYYMMDD', time_key = 'HHMM' (or '' when not picked yet).
+    role_ids = roles to tag; None means "start with PING_ROLES".
     """
+    if role_ids is None:
+        role_ids = [r.id for r in ping_roles(guild)][:MAX_PING_ROLES]
+    roles_key = encode_roles(role_ids)
+
     today = datetime.now(TZ).date()
     date_opts = []
     for i in range(DATE_CHOICES):
@@ -666,24 +685,33 @@ def schedule_picker(date_key: str = "", time_key: str = ""):
     ]
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Select(
-        custom_id=f"rsched:date:{time_key or '-'}", placeholder="📅 Pick a date", options=date_opts, row=0,
+        custom_id=f"rsched:date:{time_key or '-'}:{roles_key}", placeholder="📅 Pick a date",
+        options=date_opts, row=0,
     ))
     view.add_item(discord.ui.Select(
-        custom_id=f"rsched:time:{date_key or '-'}", placeholder=f"🕗 Pick a start time (server time, {tz_abbr()})",
-        options=time_opts, row=1,
+        custom_id=f"rsched:time:{date_key or '-'}:{roles_key}",
+        placeholder=f"🕗 Pick a start time (server time, {tz_abbr()})", options=time_opts, row=1,
+    ))
+    view.add_item(discord.ui.RoleSelect(
+        custom_id=f"rsched:roles:{date_key or '-'}:{time_key or '-'}",
+        placeholder="🔔 Roles to tag (optional)",
+        min_values=0, max_values=MAX_PING_ROLES,
+        default_values=[discord.Object(id=i) for i in role_ids],
+        row=2,
     ))
     ready = bool(date_key and time_key)
     view.add_item(discord.ui.Button(
         label="Next: raid details", emoji="➡️", style=discord.ButtonStyle.success,
-        custom_id=f"rsched:next:{date_key or '-'}:{time_key or '-'}", disabled=not ready, row=2,
+        custom_id=f"rsched:next:{date_key or '-'}:{time_key or '-'}:{roles_key}", disabled=not ready, row=3,
     ))
 
-    content = "**Schedule a raid**: pick the date and start time, then click **Next**."
+    content = "**Schedule a raid**: pick the date, start time and who to tag, then click **Next**."
     when = picked_datetime(date_key, time_key)
     if when:
         content += f"\nPicked: **<t:{int(when.timestamp())}:F>** *(shown in your local time)*"
         if when < datetime.now(TZ):
             content += "  ⚠️ that time has already passed"
+    content += "\nWill tag: " + (" ".join(f"<@&{i}>" for i in role_ids) if role_ids else "*nobody*")
     return content, view
 
 
@@ -712,9 +740,10 @@ class RaidModal(discord.ui.Modal, title="Raid details"):
         max_length=800,
     )
 
-    def __init__(self, when: datetime):
+    def __init__(self, when: datetime, role_ids=None):
         super().__init__()
         self.when = when
+        self.role_ids = role_ids  # None = use PING_ROLES
 
     async def on_submit(self, interaction: discord.Interaction):
         starts_at = int(self.when.timestamp())
@@ -731,7 +760,7 @@ class RaidModal(discord.ui.Modal, title="Raid details"):
         db.commit()
         raid = get_raid(cur.lastrowid)
         title = f"⚔️ {raid['name']} · " + self.when.strftime("%a %b ") + str(self.when.day) + " " + fmt_time(self.when.time()) + " " + tz_abbr(self.when)
-        channel_id, msg = await post_board(interaction, title, raid_embed(raid), raid_view(raid), "Raid")
+        channel_id, msg = await post_board(interaction, title, raid_embed(raid), raid_view(raid), "Raid", self.role_ids)
         db.execute("UPDATE raids SET channel_id = ?, message_id = ? WHERE id = ?", (channel_id, msg.id, raid["id"]))
         db.commit()
         await interaction.response.send_message(f"Raid posted ✅ [Jump to it]({msg.jump_url})", ephemeral=True)
@@ -756,13 +785,21 @@ def ping_roles(guild):
     return [r for r in guild.roles if r.name.lower() in PING_ROLES or str(r.id) in PING_ROLES]
 
 
-async def post_board(interaction, title, embed, view, tag_name):
+async def post_board(interaction, title, embed, view, tag_name, role_ids=None):
     """Post a poll/raid. In a forum it gets its own post (tagged if the tag exists);
-    in a normal text channel it's posted in that channel. Returns (channel_id, message)."""
-    roles = ping_roles(interaction.guild)
+    in a normal text channel it's posted in that channel. Returns (channel_id, message).
+    role_ids = roles to tag (from the Schedule Raid picker); None = PING_ROLES."""
+    guild = interaction.guild
+    if role_ids is None:
+        roles = ping_roles(guild)
+    else:
+        roles = [r for r in (guild.get_role(i) for i in role_ids) if r] if guild else []
+    everyone = any(r.is_default() for r in roles)
+    roles = [r for r in roles if not r.is_default()]
+    mentions = (["@everyone"] if everyone else []) + [r.mention for r in roles]
     ping = dict(
-        content=" ".join(r.mention for r in roles) or None,
-        allowed_mentions=discord.AllowedMentions(roles=roles, users=False, everyone=False),
+        content=" ".join(mentions) or None,
+        allowed_mentions=discord.AllowedMentions(roles=roles, users=False, everyone=everyone),
     )
     forum = forum_of(interaction.channel)
     if forum is None:
@@ -987,8 +1024,10 @@ async def handle_panel(interaction, action):
     if action == "poll":
         await interaction.response.send_modal(PollModal())
     elif action == "raid":
-        content, view = schedule_picker()
-        await interaction.response.send_message(content, view=view, ephemeral=True)
+        content, view = schedule_picker(interaction.guild)
+        await interaction.response.send_message(
+            content, view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
 
 
 async def handle_poll_day(interaction, poll_id, day):
@@ -1044,26 +1083,33 @@ async def handle_poll_slots(interaction, poll_id, day):
 
 
 async def handle_schedule_picker(interaction, rest):
-    """Date/time dropdowns and the Next button of the Schedule Raid picker."""
+    """Dropdowns and the Next button of the Schedule Raid picker."""
     if await deny_if_not_officer(interaction):
         return
     parts = rest.split(":")
     action = parts[0]
-    unset = lambda v: "" if v == "-" else v
+    part = lambda i: parts[i] if len(parts) > i else None
+    unset = lambda v: "" if v in (None, "-") else v
     values = (interaction.data or {}).get("values", [])
+    quiet = discord.AllowedMentions.none()
 
     if action == "date":
-        content, view = schedule_picker(values[0] if values else "", unset(parts[1]))
-        await interaction.response.edit_message(content=content, view=view)
+        content, view = schedule_picker(interaction.guild, values[0] if values else "", unset(part(1)), decode_roles(part(2)))
     elif action == "time":
-        content, view = schedule_picker(unset(parts[1]), values[0] if values else "")
-        await interaction.response.edit_message(content=content, view=view)
+        content, view = schedule_picker(interaction.guild, unset(part(1)), values[0] if values else "", decode_roles(part(2)))
+    elif action == "roles":
+        role_ids = [int(v) for v in values if str(v).isdigit()][:MAX_PING_ROLES]
+        content, view = schedule_picker(interaction.guild, unset(part(1)), unset(part(2)), role_ids)
     elif action == "next":
-        when = picked_datetime(unset(parts[1]), unset(parts[2]))
+        when = picked_datetime(unset(part(1)), unset(part(2)))
         if not when:
             await interaction.response.send_message("Pick a date and a start time first.", ephemeral=True)
             return
-        await interaction.response.send_modal(RaidModal(when))
+        await interaction.response.send_modal(RaidModal(when, decode_roles(part(3))))
+        return
+    else:
+        return
+    await interaction.response.edit_message(content=content, view=view, allowed_mentions=quiet)
 
 
 async def handle_poll_close(interaction, poll_id):
