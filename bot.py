@@ -59,11 +59,39 @@ DATE_CHOICES = 25  # how many upcoming days the date dropdown shows (Discord max
 MAX_POLL_DAYS = 20   # one button per day (Discord allows 25 buttons, one is "Close poll")
 MAX_POLL_SLOTS = 25  # Discord's limit for options in one dropdown
 
+# Raid roles. Role limits in the Schedule Raid form are Tank / Healer / DPS (melee + ranged together).
 ROLES = {
-    "tank": ("Tank", "🛡️"),
-    "healer": ("Healer", "💚"),
-    "dps": ("DPS", "⚔️"),
+    "tank": {"name": "Tank", "emoji": "🛡️", "group": "tank"},
+    "healer": {"name": "Healer", "emoji": "➕", "group": "healer"},
+    "melee": {"name": "Melee", "emoji": "🗡️", "group": "dps"},
+    "ranged": {"name": "Ranged", "emoji": "🏹", "group": "dps"},
+    "dps": {"name": "DPS", "emoji": "⚔️", "group": "dps"},  # signups from before classes existed
 }
+
+# Classes, their colour emoji, and the roles (with spec names) each can sign up as.
+CLASSES = {
+    "warrior": {"name": "Warrior", "emoji": "🤎", "specs": {"tank": "Protection", "melee": "Arms / Fury"}},
+    "paladin": {"name": "Paladin", "emoji": "🩷", "specs": {"tank": "Protection", "healer": "Holy", "melee": "Retribution"}},
+    "hunter": {"name": "Hunter", "emoji": "💚", "specs": {"ranged": "Beast Mastery / Marksmanship / Survival"}},
+    "rogue": {"name": "Rogue", "emoji": "💛", "specs": {"melee": "Combat / Assassination / Subtlety"}},
+    "priest": {"name": "Priest", "emoji": "🤍", "specs": {"healer": "Holy / Discipline", "ranged": "Shadow"}},
+    "shaman": {"name": "Shaman", "emoji": "💙", "specs": {"healer": "Restoration", "melee": "Enhancement", "ranged": "Elemental"}},
+    "mage": {"name": "Mage", "emoji": "🩵", "specs": {"ranged": "Frost / Fire / Arcane"}},
+    "warlock": {"name": "Warlock", "emoji": "💜", "specs": {"ranged": "Affliction / Destruction / Demonology"}},
+    "druid": {"name": "Druid", "emoji": "🧡", "specs": {"tank": "Feral (Bear)", "healer": "Restoration", "melee": "Feral (Cat)", "ranged": "Balance"}},
+}
+
+# Optional: swap in your own icons, e.g. EMOJIS=warrior=<:warrior:123456>,tank=<:tank:654321>
+for _pair in os.getenv("EMOJIS", "").split(","):
+    _key, _, _value = _pair.partition("=")
+    _key, _value = _key.strip().lower(), _value.strip()
+    if _value and _key in CLASSES:
+        CLASSES[_key]["emoji"] = _value
+    elif _value and _key in ROLES:
+        ROLES[_key]["emoji"] = _value
+
+TENTATIVE = "tentative"
+RAID_IMAGE_URL = os.getenv("RAID_IMAGE_URL", "")  # optional banner image on every raid post
 
 COLOR_POLL = 0x5865F2
 COLOR_OPEN = 0x2ECC71
@@ -103,7 +131,9 @@ db.executescript(
     );
     """
 )
-# Upgrade databases made by the first version (polls had no time slots)
+# Upgrade databases made by earlier versions
+if "class" not in [r[1] for r in db.execute("PRAGMA table_info(signups)")]:
+    db.execute("ALTER TABLE signups ADD COLUMN class TEXT")
 if "slots" not in [r[1] for r in db.execute("PRAGMA table_info(polls)")]:
     db.execute("ALTER TABLE polls ADD COLUMN slots TEXT DEFAULT ''")
 db.commit()
@@ -238,14 +268,41 @@ def is_officer(member) -> bool:
 
 
 def split_roster(raid, signups):
-    """Return {role: (main_list, bench_list)} ordered by signup time."""
+    """Split signups (in signup order) into (main, bench, tentative).
+    Anyone past a role limit (Tank / Healer / DPS) goes to the bench, in signup order."""
     caps = {"tank": raid["cap_tank"], "healer": raid["cap_healer"], "dps": raid["cap_dps"]}
-    out = {}
-    for role in ROLES:
-        people = [s for s in signups if s["role"] == role]
-        cap = caps[role] or 0
-        out[role] = (people[:cap], people[cap:]) if cap else (people, [])
-    return out
+    taken = {"tank": 0, "healer": 0, "dps": 0}
+    main, bench, tentative = [], [], []
+    for s in signups:
+        if s["role"] == TENTATIVE:
+            tentative.append(s)
+            continue
+        group = ROLES.get(s["role"], ROLES["dps"])["group"]
+        if caps[group] and taken[group] >= caps[group]:
+            bench.append(s)
+        else:
+            taken[group] += 1
+            main.append(s)
+    return main, bench, tentative
+
+
+def class_options():
+    options = []
+    for ckey, c in CLASSES.items():
+        for role, spec in c["specs"].items():
+            options.append(discord.SelectOption(
+                label=f"{c['name']} — {ROLES[role]['name']}", value=f"{ckey}:{role}",
+                description=spec[:100], emoji=c["emoji"],
+            ))
+    return options
+
+
+def describe_signup(cls, role) -> str:
+    """'Druid Healer', 'Tentative', etc."""
+    if role == TENTATIVE:
+        return "Tentative"
+    cname = CLASSES[cls]["name"] + " " if cls in CLASSES else ""
+    return cname + ROLES.get(role, ROLES["dps"])["name"]
 
 
 def parse_list(text: str, limit: int):
@@ -378,7 +435,8 @@ def slot_view(poll, day: int, user_id: int) -> discord.ui.View:
 
 def raid_embed(raid) -> discord.Embed:
     signups = raid_signups(raid["id"])
-    roster = split_roster(raid, signups)
+    number = {s["user_id"]: i + 1 for i, s in enumerate(signups)}
+    main, bench, tentative = split_roster(raid, signups)
     status = raid["status"]
 
     title = f"⚔️ {raid['name']}"
@@ -390,34 +448,72 @@ def raid_embed(raid) -> discord.Embed:
         when = f"<t:{raid['starts_at']}:F> (<t:{raid['starts_at']}:R>)"
     else:
         when = raid["when_text"] or "TBD"
-    desc = f"🗓️ {when}"
+
+    # role summary line, e.g. 🛡️ Tanks 3/4 · ➕ Healers 7/8 · 🗡️ Melee 7 · 🏹 Ranged 10 · DPS 17/28
+    count = lambda role: sum(1 for s in main if s["role"] == role)
+    def with_cap(n, cap):
+        return f"**{n}**/{cap}" if cap else f"**{n}**"
+    melee, ranged = count("melee"), count("ranged") + count("dps")
+    summary = (
+        f"{ROLES['tank']['emoji']} Tanks {with_cap(count('tank'), raid['cap_tank'])}  ·  "
+        f"{ROLES['healer']['emoji']} Healers {with_cap(count('healer'), raid['cap_healer'])}  ·  "
+        f"{ROLES['melee']['emoji']} Melee **{melee}**  ·  {ROLES['ranged']['emoji']} Ranged **{ranged}**"
+    )
+    if raid["cap_dps"]:
+        summary += f"  ·  DPS **{melee + ranged}**/{raid['cap_dps']}"
+
+    desc = ""
     if raid["notes"]:
-        desc += f"\n\n{raid['notes']}"
+        desc += f"{raid['notes']}\n\n"
+    desc += f"🗓️ {when}\n"
+    if raid["created_by"]:
+        desc += f"👑 <@{raid['created_by']}>  ·  "
+    desc += f"👥 **{len(main)}** signed up\n\n{summary}"
 
-    embed = discord.Embed(title=title, description=desc, color=color)
-    confirmed = 0
-    for role, (label, emoji) in ROLES.items():
-        main, bench = roster[role]
-        confirmed += len(main)
-        cap = raid[f"cap_{role}"]
-        header = f"{emoji} {label} ({len(main)}/{cap})" if cap else f"{emoji} {label} ({len(main)})"
-        value = "\n".join(f"• {s['name']}" for s in main) or "—"
-        if bench:
-            value += "\n*Bench:* " + ", ".join(s["name"] for s in bench)
-        if len(value) > 1024:
-            value = value[:1020] + "…"
-        embed.add_field(name=header, value=value, inline=True)
+    embed = discord.Embed(title=title, description=desc[:4096], color=color)
 
-    benched = len(signups) - confirmed
-    footer = f"{confirmed} signed up"
-    if benched:
-        footer += f" · {benched} on bench"
-    footer += {
-        "open": " · Pick your role below",
-        "locked": " · Signups locked",
-        "cancelled": "",
-    }.get(status, "")
-    embed.set_footer(text=footer)
+    def line(s):
+        return f"{ROLES.get(s['role'], ROLES['dps'])['emoji']} `{number[s['user_id']]}` {s['name']}"
+
+    # one column per class, in class order; signups from before classes existed go under "Other"
+    groups = [(c["emoji"] + " " + c["name"], [s for s in main if s["class"] == key]) for key, c in CLASSES.items()]
+    groups.append(("❓ Other", [s for s in main if s["class"] not in CLASSES]))
+    shown = 0
+    for name, people in groups:
+        if people:
+            value = "\n".join(line(s) for s in people)
+            embed.add_field(name=f"{name} ({len(people)})", value=value[:1020] + ("…" if len(value) > 1020 else ""), inline=True)
+            shown += 1
+    if not shown:
+        embed.add_field(name="No signups yet", value="Pick your class & role from the dropdown below.", inline=False)
+    elif shown % 3:  # pad the last row so columns line up
+        for _ in range(3 - shown % 3):
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+    def short(s):
+        cls = CLASSES.get(s["class"])
+        if cls:
+            icon = cls["emoji"]
+        elif s["role"] == TENTATIVE:
+            icon = "⚖️"
+        else:
+            icon = ROLES.get(s["role"], ROLES["dps"])["emoji"]
+        return f"{icon} `{number[s['user_id']]}` {s['name']}"
+
+    if bench:
+        value = ", ".join(short(s) for s in bench)
+        embed.add_field(name=f"🪑 Bench ({len(bench)})", value=value[:1024], inline=False)
+    if tentative:
+        value = ", ".join(short(s) for s in tentative)
+        embed.add_field(name=f"⚖️ Tentative ({len(tentative)})", value=value[:1024], inline=False)
+
+    if RAID_IMAGE_URL:
+        embed.set_image(url=RAID_IMAGE_URL)
+    embed.set_footer(text={
+        "open": "Pick your class & role below · Pick again to change it",
+        "locked": "Signups locked",
+        "cancelled": "Raid cancelled",
+    }.get(status, ""))
     return embed
 
 
@@ -427,24 +523,25 @@ def raid_view(raid) -> discord.ui.View:
     status = raid["status"]
     signups_closed = status != "open"
 
-    for role, (label, emoji) in ROLES.items():
-        view.add_item(
-            discord.ui.Button(
-                label=label,
-                emoji=emoji,
-                style=discord.ButtonStyle.primary,
-                custom_id=f"raid:{rid}:{role}",
-                disabled=signups_closed,
-                row=0,
-            )
-        )
     view.add_item(
-        discord.ui.Button(
-            label="Leave",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"raid:{rid}:leave",
+        discord.ui.Select(
+            custom_id=f"raid:{rid}:class",
+            placeholder="⚔️ Sign up: pick your class & role",
+            options=class_options(),
             disabled=signups_closed,
             row=0,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Tentative", emoji="⚖️", style=discord.ButtonStyle.secondary,
+            custom_id=f"raid:{rid}:tentative", disabled=signups_closed, row=1,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="Leave", style=discord.ButtonStyle.secondary,
+            custom_id=f"raid:{rid}:leave", disabled=signups_closed, row=1,
         )
     )
     view.add_item(
@@ -459,12 +556,8 @@ def raid_view(raid) -> discord.ui.View:
     )
     view.add_item(
         discord.ui.Button(
-            label="Cancel raid",
-            emoji="🗑️",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"raidcancel:{rid}",
-            disabled=status == "cancelled",
-            row=1,
+            label="Cancel raid", emoji="🗑️", style=discord.ButtonStyle.danger,
+            custom_id=f"raidcancel:{rid}", disabled=status == "cancelled", row=1,
         )
     )
     return view
@@ -971,34 +1064,59 @@ async def handle_raid_signup(interaction, raid_id, action):
         await interaction.response.send_message("Signups are closed for this raid.", ephemeral=True)
         return
     uid = interaction.user.id
+    current = db.execute(
+        "SELECT * FROM signups WHERE raid_id = ? AND user_id = ?", (raid_id, uid)
+    ).fetchone()
 
     if action == "leave":
+        if not current:
+            await interaction.response.send_message("You're not signed up for this raid.", ephemeral=True)
+            return
         db.execute("DELETE FROM signups WHERE raid_id = ? AND user_id = ?", (raid_id, uid))
-    elif action in ROLES:
-        current = db.execute(
-            "SELECT role FROM signups WHERE raid_id = ? AND user_id = ?", (raid_id, uid)
-        ).fetchone()
-        if current and current["role"] == action:
+    else:
+        if action == "class":
+            values = (interaction.data or {}).get("values", [])
+            cls, _, role = (values[0] if values else "").partition(":")
+            if cls not in CLASSES or role not in CLASSES[cls]["specs"]:
+                return
+        elif action == TENTATIVE:
+            cls, role = (current["class"] if current else None), TENTATIVE
+        elif action in ("tank", "healer", "dps"):  # buttons on posts from before classes existed
+            cls, role = None, action
+        else:
+            return
+
+        if current and current["role"] == role and current["class"] == cls:
             await interaction.response.send_message(
-                f"You're already signed up as **{ROLES[action][0]}**. Use **Leave** to drop out.", ephemeral=True
+                f"You're already signed up as **{describe_signup(cls, role)}**. "
+                "Pick something else to change it, or click **Leave**.",
+                ephemeral=True,
             )
             return
-        db.execute(
-            """INSERT INTO signups (raid_id, user_id, name, role, joined_at) VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT (raid_id, user_id) DO UPDATE SET
-                   role = excluded.role, name = excluded.name, joined_at = excluded.joined_at""",
-            (raid_id, uid, interaction.user.display_name, action, time.time()),
+
+        # Changing class/spec within the same role group keeps your place in line;
+        # moving to a different role (or from tentative) puts you at the back of that role.
+        same_group = (
+            current is not None and TENTATIVE not in (current["role"], role)
+            and ROLES.get(current["role"], ROLES["dps"])["group"] == ROLES[role]["group"]
         )
-    else:
-        return
+        joined_at = current["joined_at"] if same_group else time.time()
+        db.execute(
+            """INSERT INTO signups (raid_id, user_id, name, role, class, joined_at) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (raid_id, user_id) DO UPDATE SET
+                   role = excluded.role, class = excluded.class, name = excluded.name,
+                   joined_at = excluded.joined_at""",
+            (raid_id, uid, interaction.user.display_name, role, cls, joined_at),
+        )
     db.commit()
     await interaction.response.edit_message(embed=raid_embed(raid), view=raid_view(raid))
 
-    if action in ROLES:
-        main, bench = split_roster(raid, raid_signups(raid_id))[action]
+    if action != "leave" and role != TENTATIVE:
+        _, bench, _ = split_roster(raid, raid_signups(raid_id))
         if any(s["user_id"] == uid for s in bench):
+            group = {"tank": "Tank", "healer": "Healer", "dps": "DPS"}[ROLES[role]["group"]]
             await interaction.followup.send(
-                f"**{ROLES[action][0]}** is full, so you're on the bench — you'll move up if someone leaves.",
+                f"**{group}** spots are full, so you're on the bench — you'll move up if someone leaves.",
                 ephemeral=True,
             )
 
