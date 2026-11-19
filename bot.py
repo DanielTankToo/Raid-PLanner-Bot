@@ -46,9 +46,10 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: makes /raidpanel show up instantly
 # Optional: channel(s) (forum or text) where the bot keeps the panel automatically - no /raidpanel
 # needed. One per server, comma separated, e.g. PANEL_CHANNEL_ID=111111111111,222222222222
 PANEL_CHANNEL_IDS = [int(x) for x in os.getenv("PANEL_CHANNEL_ID", "").replace(" ", "").split(",") if x.isdigit()]
-# Optional: roles to tag when a raid or Raid Night Poll is posted, by name (or ID), comma separated.
+# Roles to tag when a raid or Raid Night Poll is posted, by name (or ID), comma separated.
+# Defaults to Raider; set PING_ROLES=none to tag nobody.
 # Matched in each server separately, e.g. PING_ROLES=Raider,Trial
-PING_ROLES = [r.strip().lower() for r in os.getenv("PING_ROLES", "").split(",") if r.strip()]
+PING_ROLES = [r.strip().lower() for r in os.getenv("PING_ROLES", "Raider").split(",") if r.strip()]
 FORUM_ARCHIVE_MINUTES = 10080  # forum posts stay active 7 days (Discord's max) before going quiet
 
 DEFAULT_NIGHTS = "Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, Monday"
@@ -692,20 +693,13 @@ def schedule_picker(guild, date_key: str = "", time_key: str = "", role_ids=None
         custom_id=f"rsched:time:{date_key or '-'}:{roles_key}",
         placeholder=f"🕗 Pick a start time (server time, {tz_abbr()})", options=time_opts, row=1,
     ))
-    view.add_item(discord.ui.RoleSelect(
-        custom_id=f"rsched:roles:{date_key or '-'}:{time_key or '-'}",
-        placeholder="🔔 Roles to tag (optional)",
-        min_values=0, max_values=MAX_PING_ROLES,
-        default_values=[discord.Object(id=i) for i in role_ids],
-        row=2,
-    ))
     ready = bool(date_key and time_key)
     view.add_item(discord.ui.Button(
         label="Next: raid details", emoji="➡️", style=discord.ButtonStyle.success,
-        custom_id=f"rsched:next:{date_key or '-'}:{time_key or '-'}:{roles_key}", disabled=not ready, row=3,
+        custom_id=f"rsched:next:{date_key or '-'}:{time_key or '-'}:{roles_key}", disabled=not ready, row=2,
     ))
 
-    content = "**Schedule a raid**: pick the date, start time and who to tag, then click **Next**."
+    content = "**Schedule a raid**: pick the date and start time, then click **Next**."
     when = picked_datetime(date_key, time_key)
     if when:
         content += f"\nPicked: **<t:{int(when.timestamp())}:F>** *(shown in your local time)*"
