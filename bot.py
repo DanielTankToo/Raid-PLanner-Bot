@@ -287,14 +287,30 @@ def split_roster(raid, signups):
 
 
 def class_options():
-    options = []
-    for ckey, c in CLASSES.items():
-        for role, spec in c["specs"].items():
-            options.append(discord.SelectOption(
-                label=f"{c['name']} — {ROLES[role]['name']}", value=f"{ckey}:{role}",
-                description=spec[:100], emoji=c["emoji"],
-            ))
-    return options
+    """The raid post's dropdown: one option per class."""
+    return [
+        discord.SelectOption(
+            label=c["name"], value=key, emoji=c["emoji"],
+            description=" / ".join(ROLES[r]["name"] for r in c["specs"]),
+        )
+        for key, c in CLASSES.items()
+    ]
+
+
+def spec_view(raid_id: int, cls: str) -> discord.ui.View:
+    """Private follow-up dropdown with just this class's specs."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Select(
+        custom_id=f"raidspec:{raid_id}:{cls}",
+        placeholder="Pick your spec",
+        options=[
+            discord.SelectOption(
+                label=f"{ROLES[role]['name']}: {spec}"[:100], value=role, emoji=ROLES[role]["emoji"],
+            )
+            for role, spec in CLASSES[cls]["specs"].items()
+        ],
+    ))
+    return view
 
 
 def describe_signup(cls, role) -> str:
@@ -485,7 +501,7 @@ def raid_embed(raid) -> discord.Embed:
             embed.add_field(name=f"{name} ({len(people)})", value=value[:1020] + ("…" if len(value) > 1020 else ""), inline=True)
             shown += 1
     if not shown:
-        embed.add_field(name="No signups yet", value="Pick your class & role from the dropdown below.", inline=False)
+        embed.add_field(name="No signups yet", value="Pick your class from the dropdown below.", inline=False)
     elif shown % 3:  # pad the last row so columns line up
         for _ in range(3 - shown % 3):
             embed.add_field(name="\u200b", value="\u200b", inline=True)
@@ -510,7 +526,7 @@ def raid_embed(raid) -> discord.Embed:
     if RAID_IMAGE_URL:
         embed.set_image(url=RAID_IMAGE_URL)
     embed.set_footer(text={
-        "open": "Pick your class & role below · Pick again to change it",
+        "open": "Pick your class below, then your spec · Pick again to change it",
         "locked": "Signups locked",
         "cancelled": "Raid cancelled",
     }.get(status, ""))
@@ -526,7 +542,7 @@ def raid_view(raid) -> discord.ui.View:
     view.add_item(
         discord.ui.Select(
             custom_id=f"raid:{rid}:class",
-            placeholder="⚔️ Sign up: pick your class & role",
+            placeholder="⚔️ Sign up: pick your class",
             options=class_options(),
             disabled=signups_closed,
             row=0,
@@ -909,6 +925,9 @@ async def on_interaction(interaction: discord.Interaction):
             await handle_raid_signup(interaction, int(raid_id), action)
         elif kind == "rsched":
             await handle_schedule_picker(interaction, rest)
+        elif kind == "raidspec":
+            raid_id, cls = rest.split(":")
+            await handle_raid_spec(interaction, int(raid_id), cls)
         elif kind == "raidlock":
             await handle_raid_lock(interaction, int(rest))
         elif kind == "raidcancel":
@@ -1056,69 +1075,125 @@ async def handle_poll_close(interaction, poll_id):
     await interaction.response.edit_message(embed=poll_embed(poll), view=poll_view(poll))
 
 
+def save_signup(raid_id, user, cls, role):
+    """Add or change a signup. Returns an error message, or None if saved."""
+    current = db.execute(
+        "SELECT * FROM signups WHERE raid_id = ? AND user_id = ?", (raid_id, user.id)
+    ).fetchone()
+    if current and current["role"] == role and current["class"] == cls:
+        return (f"You're already signed up as **{describe_signup(cls, role)}**. "
+                "Pick something else to change it, or click **Leave**.")
+    # Changing class/spec within the same role group keeps your place in line;
+    # moving to a different role (or from tentative) puts you at the back of that role.
+    same_group = (
+        current is not None and TENTATIVE not in (current["role"], role)
+        and ROLES.get(current["role"], ROLES["dps"])["group"] == ROLES[role]["group"]
+    )
+    joined_at = current["joined_at"] if same_group else time.time()
+    db.execute(
+        """INSERT INTO signups (raid_id, user_id, name, role, class, joined_at) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (raid_id, user_id) DO UPDATE SET
+               role = excluded.role, class = excluded.class, name = excluded.name,
+               joined_at = excluded.joined_at""",
+        (raid_id, user.id, user.display_name, role, cls, joined_at),
+    )
+    db.commit()
+    return None
+
+
+def bench_note(raid, user_id, role) -> str:
+    if role == TENTATIVE:
+        return ""
+    _, bench, _ = split_roster(raid, raid_signups(raid["id"]))
+    if any(s["user_id"] == user_id for s in bench):
+        group = {"tank": "Tank", "healer": "Healer", "dps": "DPS"}[ROLES[role]["group"]]
+        return f"**{group}** spots are full, so you're on the bench — you'll move up if someone leaves."
+    return ""
+
+
+async def refresh_raid_post(raid):
+    """Update a raid post from somewhere other than the post itself (e.g. the private spec picker)."""
+    try:
+        channel = client.get_channel(raid["channel_id"]) or await client.fetch_channel(raid["channel_id"])
+        await wake_thread(channel)
+        await channel.get_partial_message(raid["message_id"]).edit(embed=raid_embed(raid), view=raid_view(raid))
+    except discord.HTTPException:
+        log.exception("Couldn't refresh raid %s", raid["id"])
+
+
 async def handle_raid_signup(interaction, raid_id, action):
+    """Buttons and the class dropdown on the raid post itself."""
     raid = get_raid(raid_id)
     if await reject_unknown(interaction, raid):
         return
     if raid["status"] != "open":
         await interaction.response.send_message("Signups are closed for this raid.", ephemeral=True)
         return
-    uid = interaction.user.id
-    current = db.execute(
-        "SELECT * FROM signups WHERE raid_id = ? AND user_id = ?", (raid_id, uid)
-    ).fetchone()
+    user = interaction.user
 
     if action == "leave":
-        if not current:
+        deleted = db.execute("DELETE FROM signups WHERE raid_id = ? AND user_id = ?", (raid_id, user.id)).rowcount
+        db.commit()
+        if not deleted:
             await interaction.response.send_message("You're not signed up for this raid.", ephemeral=True)
             return
-        db.execute("DELETE FROM signups WHERE raid_id = ? AND user_id = ?", (raid_id, uid))
-    else:
-        if action == "class":
-            values = (interaction.data or {}).get("values", [])
-            cls, _, role = (values[0] if values else "").partition(":")
-            if cls not in CLASSES or role not in CLASSES[cls]["specs"]:
-                return
-        elif action == TENTATIVE:
-            cls, role = (current["class"] if current else None), TENTATIVE
-        elif action in ("tank", "healer", "dps"):  # buttons on posts from before classes existed
-            cls, role = None, action
-        else:
-            return
+        await interaction.response.edit_message(embed=raid_embed(raid), view=raid_view(raid))
+        return
 
-        if current and current["role"] == role and current["class"] == cls:
+    if action == "class":
+        values = (interaction.data or {}).get("values", [])
+        cls = values[0] if values else ""
+        if cls not in CLASSES:
+            return
+        specs = CLASSES[cls]["specs"]
+        if len(specs) > 1:  # ask for the spec privately; the post updates once they pick
             await interaction.response.send_message(
-                f"You're already signed up as **{describe_signup(cls, role)}**. "
-                "Pick something else to change it, or click **Leave**.",
-                ephemeral=True,
+                f"{CLASSES[cls]['emoji']} **{CLASSES[cls]['name']}**: which spec are you bringing?",
+                view=spec_view(raid_id, cls), ephemeral=True,
             )
             return
+        role = next(iter(specs))
+    elif action == TENTATIVE:
+        current = db.execute(
+            "SELECT class FROM signups WHERE raid_id = ? AND user_id = ?", (raid_id, user.id)
+        ).fetchone()
+        cls, role = (current["class"] if current else None), TENTATIVE
+    elif action in ("tank", "healer", "dps"):  # buttons on posts from before classes existed
+        cls, role = None, action
+    else:
+        return
 
-        # Changing class/spec within the same role group keeps your place in line;
-        # moving to a different role (or from tentative) puts you at the back of that role.
-        same_group = (
-            current is not None and TENTATIVE not in (current["role"], role)
-            and ROLES.get(current["role"], ROLES["dps"])["group"] == ROLES[role]["group"]
-        )
-        joined_at = current["joined_at"] if same_group else time.time()
-        db.execute(
-            """INSERT INTO signups (raid_id, user_id, name, role, class, joined_at) VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT (raid_id, user_id) DO UPDATE SET
-                   role = excluded.role, class = excluded.class, name = excluded.name,
-                   joined_at = excluded.joined_at""",
-            (raid_id, uid, interaction.user.display_name, role, cls, joined_at),
-        )
-    db.commit()
+    error = save_signup(raid_id, user, cls, role)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
     await interaction.response.edit_message(embed=raid_embed(raid), view=raid_view(raid))
+    note = bench_note(raid, user.id, role)
+    if note:
+        await interaction.followup.send(note, ephemeral=True)
 
-    if action != "leave" and role != TENTATIVE:
-        _, bench, _ = split_roster(raid, raid_signups(raid_id))
-        if any(s["user_id"] == uid for s in bench):
-            group = {"tank": "Tank", "healer": "Healer", "dps": "DPS"}[ROLES[role]["group"]]
-            await interaction.followup.send(
-                f"**{group}** spots are full, so you're on the bench — you'll move up if someone leaves.",
-                ephemeral=True,
-            )
+
+async def handle_raid_spec(interaction, raid_id, cls):
+    """The private spec dropdown that follows a class pick."""
+    raid = get_raid(raid_id)
+    if raid is None or raid["status"] != "open":
+        await interaction.response.edit_message(content="Signups are closed for this raid.", view=None)
+        return
+    values = (interaction.data or {}).get("values", [])
+    role = values[0] if values else ""
+    if cls not in CLASSES or role not in CLASSES[cls]["specs"]:
+        return
+    error = save_signup(raid_id, interaction.user, cls, role)
+    if error:
+        await interaction.response.edit_message(content=error, view=None)
+        return
+    spec = CLASSES[cls]["specs"][role]
+    content = f"✅ You're signed up as **{describe_signup(cls, role)}** ({spec})."
+    note = bench_note(raid, interaction.user.id, role)
+    if note:
+        content += "\n" + note
+    await interaction.response.edit_message(content=content, view=None)
+    await refresh_raid_post(raid)
 
 
 async def handle_raid_lock(interaction, raid_id):
