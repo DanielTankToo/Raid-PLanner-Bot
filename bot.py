@@ -891,12 +891,20 @@ class RaidBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
+        # Only re-register slash commands with Discord when they've changed: syncing on every
+        # restart gets the bot rate limited if it's restarted a few times in a row.
+        signature = f"{GUILD_ID or 'global'}|" + "|".join(
+            sorted(f"{c.name}:{c.description}" for c in self.tree.get_commands())
+        )
+        if get_setting("synced_commands") != signature:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+            else:
+                await self.tree.sync()
+            set_setting("synced_commands", signature)
+            log.info("Slash commands registered with Discord")
         if REMINDER_MINUTES > 0:
             reminder_loop.start()
 
