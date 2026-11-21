@@ -46,10 +46,6 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: makes /raidpanel show up instantly
 # Optional: channel(s) (forum or text) where the bot keeps the panel automatically - no /raidpanel
 # needed. One per server, comma separated, e.g. PANEL_CHANNEL_ID=111111111111,222222222222
 PANEL_CHANNEL_IDS = [int(x) for x in os.getenv("PANEL_CHANNEL_ID", "").replace(" ", "").split(",") if x.isdigit()]
-# Roles to tag when a raid or Raid Night Poll is posted, by name (or ID), comma separated.
-# Defaults to Raider; set PING_ROLES=none to tag nobody.
-# Matched in each server separately, e.g. PING_ROLES=Raider,Trial
-PING_ROLES = [r.strip().lower() for r in os.getenv("PING_ROLES", "Raider").split(",") if r.strip()]
 FORUM_ARCHIVE_MINUTES = 10080  # forum posts stay active 7 days (Discord's max) before going quiet
 
 DEFAULT_NIGHTS = "Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, Monday"
@@ -652,9 +648,9 @@ def encode_roles(role_ids) -> str:
 
 
 def decode_roles(text):
-    """'-' -> [], '1.2' -> [1, 2], None (older pickers) -> None (use PING_ROLES)."""
+    """'-' or missing -> [], '1.2' -> [1, 2]."""
     if text is None:
-        return None
+        return []
     return [int(x) for x in text.split(".") if x.isdigit()][:MAX_PING_ROLES]
 
 
@@ -664,10 +660,9 @@ def schedule_picker(guild, date_key: str = "", time_key: str = "", role_ids=None
     The current picks ride along in each component's custom_id, so nothing is kept in
     memory and the picker still works if the bot restarts.
     date_key = 'YYYYMMDD', time_key = 'HHMM' (or '' when not picked yet).
-    role_ids = roles to tag; None means "start with PING_ROLES".
+    role_ids = roles picked in the "Roles to tag" dropdown (starts empty).
     """
-    if role_ids is None:
-        role_ids = [r.id for r in ping_roles(guild)][:MAX_PING_ROLES]
+    role_ids = list(role_ids or [])[:MAX_PING_ROLES]
     roles_key = encode_roles(role_ids)
 
     today = datetime.now(TZ).date()
@@ -693,13 +688,20 @@ def schedule_picker(guild, date_key: str = "", time_key: str = "", role_ids=None
         custom_id=f"rsched:time:{date_key or '-'}:{roles_key}",
         placeholder=f"🕗 Pick a start time (server time, {tz_abbr()})", options=time_opts, row=1,
     ))
+    view.add_item(discord.ui.RoleSelect(
+        custom_id=f"rsched:roles:{date_key or '-'}:{time_key or '-'}",
+        placeholder="🔔 Roles to tag (optional)",
+        min_values=0, max_values=MAX_PING_ROLES,
+        default_values=[discord.Object(id=i) for i in role_ids],
+        row=2,
+    ))
     ready = bool(date_key and time_key)
     view.add_item(discord.ui.Button(
         label="Next: raid details", emoji="➡️", style=discord.ButtonStyle.success,
-        custom_id=f"rsched:next:{date_key or '-'}:{time_key or '-'}:{roles_key}", disabled=not ready, row=2,
+        custom_id=f"rsched:next:{date_key or '-'}:{time_key or '-'}:{roles_key}", disabled=not ready, row=3,
     ))
 
-    content = "**Schedule a raid**: pick the date and start time, then click **Next**."
+    content = "**Schedule a raid**: pick the date, start time and any roles to tag, then click **Next**."
     when = picked_datetime(date_key, time_key)
     if when:
         content += f"\nPicked: **<t:{int(when.timestamp())}:F>** *(shown in your local time)*"
@@ -737,7 +739,7 @@ class RaidModal(discord.ui.Modal, title="Raid details"):
     def __init__(self, when: datetime, role_ids=None):
         super().__init__()
         self.when = when
-        self.role_ids = role_ids  # None = use PING_ROLES
+        self.role_ids = role_ids or []  # roles picked in the Schedule Raid dropdown
 
     async def on_submit(self, interaction: discord.Interaction):
         starts_at = int(self.when.timestamp())
@@ -772,22 +774,12 @@ def forum_of(channel):
     return None
 
 
-def ping_roles(guild):
-    """The PING_ROLES that exist in this server (matched by name or ID)."""
-    if guild is None or not PING_ROLES:
-        return []
-    return [r for r in guild.roles if r.name.lower() in PING_ROLES or str(r.id) in PING_ROLES]
-
-
 async def post_board(interaction, title, embed, view, tag_name, role_ids=None):
     """Post a poll/raid. In a forum it gets its own post (tagged if the tag exists);
     in a normal text channel it's posted in that channel. Returns (channel_id, message).
-    role_ids = roles to tag (from the Schedule Raid picker); None = PING_ROLES."""
+    role_ids = roles to tag (picked in the Schedule Raid dropdown); none = no tags."""
     guild = interaction.guild
-    if role_ids is None:
-        roles = ping_roles(guild)
-    else:
-        roles = [r for r in (guild.get_role(i) for i in role_ids) if r] if guild else []
+    roles = [r for r in (guild.get_role(i) for i in (role_ids or [])) if r] if guild else []
     everyone = any(r.is_default() for r in roles)
     roles = [r for r in roles if not r.is_default()]
     mentions = (["@everyone"] if everyone else []) + [r.mention for r in roles]
